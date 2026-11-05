@@ -1,0 +1,58 @@
+name: Deploy zu Infomaniak
+
+# Läuft bei jedem Push auf main und von Hand (Actions > Deploy > Run workflow).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PHP-Syntax prüfen
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq php-cli
+          for f in api/*.php; do php -l "$f"; done
+
+      - name: Sicherstellen, dass keine Geheimnisse im Repository liegen
+        run: |
+          test ! -f api/config.php || { echo "api/config.php darf nicht im Repository liegen"; exit 1; }
+          if git ls-files | grep -E '\.(sqlite|enc|log)$'; then echo "Daten- oder Sicherungsdateien im Repository"; exit 1; fi
+
+      - name: SSH-Zugang vorbereiten
+        env:
+          KEY: ${{ secrets.SFTP_KEY }}
+          HOSTKEY: ${{ secrets.SFTP_HOST_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$HOSTKEY" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+
+      - name: Hochladen (config.php und Daten auf dem Server bleiben unberührt)
+        env:
+          HOST: ${{ secrets.SFTP_HOST }}
+          USER: ${{ secrets.SFTP_USER }}
+          REMOTE: ${{ secrets.SFTP_PATH }}
+        run: |
+          # Nur Dateien aus dem Repository werden übertragen. api/config.php und api/data/*
+          # liegen nicht im Repository und werden deshalb weder überschrieben noch gelöscht.
+          tar --exclude=./.git --exclude=./.github --exclude=./.gitignore \
+              --exclude=./README.md --exclude=./DEPLOY.md -czf /tmp/deploy.tgz .
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts \
+              -o BatchMode=yes "$USER@$HOST" "mkdir -p '$REMOTE' && cd '$REMOTE' && tar xzf - --no-same-owner && chmod 750 api/data 2>/dev/null; ls -l index.html api/index.php" < /tmp/deploy.tgz
+
+      - name: Erreichbarkeit prüfen
+        env:
+          URL: ${{ secrets.SITE_URL }}
+        run: |
+          sleep 3
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/api/index.php?a=me")
+          echo "api/me: HTTP $code"
+          test "$code" = "200"
